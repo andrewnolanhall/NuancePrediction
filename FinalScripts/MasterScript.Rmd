@@ -1,0 +1,535 @@
+---
+title: "Predicting Nuances"
+author: "Andrew N Hall, Sandra Matz"
+date: "7/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+## Load required libraries
+
+```{r message = FALSE, warning = FALSE}
+library(tidyverse) #data loading, manipulation, visualization
+library(Matrix) #creating sparse matrix
+library(irlba) #singular value decomp and PCA for sparse matrices
+library(topicmodels) #LDA analysis
+library(reshape2) #heatmapping with ggplot2
+library(randomForest)
+library(beepr)
+library(kableExtra)
+library(glmnet)
+library(ranger) #for parallel random forest
+library(foreach) #for parallel processing
+library(doParallel)
+```
+
+
+## Load data 
+
+Data utilized in this project come from the myPersonality database (collected between 2007 and 2012), which consists of several thousand individuals who provided responses to personality and individual difference measures and voluntarily shared their Facebook profiles for research purposes. These data have previously been used to demonstrate that personality can be predicted with a high degree of accuracy from a person’s Facebook Likes (e.g., Kosinski, Stillwell, & Graepel, 2013; Youyou, Kosinski, & Stillwell, 2015). 
+
+For the current project, I want to see if we can improve upon our personality predictions by targeting personality nuances prior to the construction of personality scale scores. Thus, we will construct multiple models of personality items, constrruct personality traits from these items, then compare with the models built to predict scale scores outright. These predicted values will be compared to self-reported personality responses. 
+
+At present, there are three datasets of interest. The `userlikes` dataset is a large 3,646,237 by 2 matrix, with `likeid` as one column and `userid` as another. This dataset links the pages liked and the users who liked those pages. The `big5_items` dataset consists of 46,179,302 rows of users and their responses on personality items. A subset of these users  (those who have responded to all 100 items in the IPIP-100) will be used in these analyses.
+
+```{r message = FALSE}
+big5_items <- read_csv("data/big5_domains_item_level.csv") #3,646,237 <- original large sample
+userlikes <- read_csv("data/user_like.csv") #46,179,302 <- original large sample
+```
+
+## Get usable data
+
+How many users if we only use complete data? 
+
+```{r}
+big5_items_complete <- big5_items %>% 
+  select(userid:q100, E:C)
+big5_items_complete <- big5_items_complete[complete.cases(big5_items_complete),] #reduced to 774,411
+```
+
+For now, use only complete data: 
+```{r}
+big5_items <- big5_items_complete
+rm(big5_items_complete)
+```
+
+Reduce user like dataset to only have users from above: 
+```{r}
+userlikes_complete <- userlikes %>% filter(userid %in% big5_items$userid) #7,945,156
+userlikes <- userlikes_complete
+rm(userlikes_complete)
+```
+
+**NOTE**: the following three steps are just to check to make sure pages are liked at least once. Don't use the following to reduce the sample. If you reduce by number of likes, you change number of pages available. Then if you change number of pages, you will change number of likes. need to do this iteratively at the sparse matrix step later on. Leaving here so you don't do again. 
+
+Only get likes that occur more than 0 times (i.e., liked more than 0 times)
+```{r}
+userlikes_reduced <-  userlikes %>% group_by(like_id) %>% filter(n()>0) #5,110,225
+```
+
+Get only users who have liked more than 0 pages. 
+```{r}
+userlikes_reduced <-  userlikes_reduced %>% group_by(userid) %>% filter(n()>0) #5,042,603
+```
+
+Now reduce the personality dataset to only have users who have likes at least 1 page: 
+```{r}
+big5_items_reduced <- big5_items %>% filter(userid %in% userlikes_reduced$userid) #51,198
+```
+
+Now rename to reduce confusion. 
+```{r}
+big5_items <- big5_items_reduced
+userlikes <- userlikes_reduced
+rm(big5_items_reduced,userlikes_reduced)
+```
+
+We are left with two datasets. One with only 38,734 people and the other with the associated likes (5,042,603).
+
+## Data Manipulation and Cleaning
+
+The data are restructured as follows:
+
+The first thing we need to do is manipulate the `userlikes` dataset to give each observation one row and each potential like its own column. Since there are over 5 million potential likes and 38,734 users, this dataset will be incredibly sparse (i.e., there will be many columns with no corresponding response). We thus want to use the `sparseMatrix` function in the `Matrix` package to create a large sparse matrix that represents the users and the associated likes together. This is achieved through the following code:
+
+
+
+```{r}
+userlikes$user_row <- match(userlikes$userid, big5_items$userid) #produces column of row positions of users matching w/ personality data
+userlikes$like_row <- match(userlikes$like_id, userlikes$like_id) #produces column of row positions of likes matching w/ userlikes data
+sparseM <- sparseMatrix(i = userlikes$user_row, j = userlikes$like_row, x = 1) #sparse matrix linking table matching the users with their likes. 
+rownames(sparseM) <- big5_items$userid
+colnames(sparseM) <- userlikes$like_id
+# userlikes %>% group_by(user_row) %>% summarize(n()) %>% dim()
+```
+
+Need to reduce matrix recursively like this bc every time you take away a person, you might change number of likes for a certain page and vice versa. 
+
+Get pages that have been liked at least 20 times and people who have liked at least 20 pages. 
+
+```{r}
+repeat {
+  i <- sum(dim(sparseM))
+  sparseM <- sparseM[rowSums(sparseM) > 20, colSums(sparseM) > 20]
+    if(sum(dim(sparseM)) == i) break
+}
+
+userlikes_reduced <- userlikes[match(rownames(sparseM), userlikes$userid),]
+big5_items_reduced <- big5_items[match(rownames(sparseM), big5_items$userid),]
+big5_items <- big5_items_reduced
+rm(userlikes_reduced, big5_items_reduced)
+rm(userlikes)  #just use sparse for likes
+
+#add column names to sparse matrix (needed for ranger package) <- added above so no longer needed
+#colnames(sparseM) <- paste("like", seq(1, ncol(sparseM)), sep = "_")
+```
+
+
+## Make new personality variables
+```{r}
+pers_dat <- big5_items
+
+#check to make sure the way you create composite scores match
+pers_dat <- pers_dat %>% 
+  mutate(
+    E_comp = (q3 + q10 +  (q14) + (q18) + q23 + (q29) + q33 + (q39) + q43 + (q49) + q53 + (q59) + q63 + (q69) + q73 + (q79) + q83 + (q89) + q93 + (q99))/20,
+    
+    N_comp = ((q11) + q12 + q17 + (q19) + (q27) + q30 + (q37) + q40 + (q47) + q50 +  (q57) + q60 +  (q67) + q70 + (q77) + q80 + (q87) + q90 + (q97) + q100)/20,
+    
+    O_comp = (q1 + (q4) + (q7) + q16 + q21 + (q24) + q31 + (q34) + q41 + (q44) + q51 + (q54) + q61 + (q64) + q71 + (q74) + q81 + (q84) + q91 + (q94))/20,
+    
+    A_comp = ((q2) + q6 + (q9) +  q13 + (q22) + q26 + (q32) + q36 + (q42) + q46 + (q52) + q56 + (q62) + q66 + (q72) + q76 + (q82) + q86 + (q92) + q96)/20,
+    
+    C_comp = (q5 + (q8) + q15 + (q20) + q25 + (q28) + q35 + (q38) + q45 + (q48) + q55 + (q58) + q65 + (q68) + q75 + (q78) + q85 + (q88) + q95 + (q98))/20
+  )
+
+write.csv(pers_dat, "personality_reduced_data.csv")
+cor(pers_dat[,102:111]) #they match
+rm(big5_items)
+```
+
+Check alphas of scales 
+
+```{r}
+pers_dat2 <- as.data.frame(pers_dat)
+E_alpha <- pers_dat %>% select(q3, q10, q14, q18, q23, q29, q33, q39, q43, q49, q53, q59, q63, q69, q73, q79, q83, q89, q93, q99)
+E_alpha <- alpha(E_alpha, check.keys = T)
+E_alpha <- E_alpha$total[[1]]
+
+N_alpha <- pers_dat %>% select(q11, q12, q17, q19, q27, q30, q37, q40, q47, q50, q57, q60, q67, q70, q77, q80, q87, q90, q97, q100)
+N_alpha <- alpha(N_alpha, check.keys = T)
+N_alpha <- N_alpha$total[[1]]
+
+O_alpha <- pers_dat %>% select(q1, q4, q7, q16, q21, q24, q31, q34, q41, q44, q51, q54, q61, q64, q71, q74, q81, q84, q91, q94)
+O_alpha <- alpha(O_alpha, check.keys = T)
+O_alpha <- O_alpha$total[[1]]
+    
+A_alpha <- pers_dat %>% select(q2, q6, q9,  q13, q22, q26, q32, q36, q42, q46, q52, q56, q62, q66, q72, q76, q82, q86, q92, q96)
+A_alpha <- alpha(A_alpha, check.keys = T)
+A_alpha <- A_alpha$total[[1]]
+    
+C_alpha <- pers_dat %>% select(q5 , q8, q15, q20, q25, q28, q35, q38, q45, q48, q55, q58, q65, q68, q75, q78, q85, q88, q95, q98)
+C_alpha <- alpha(C_alpha, check.keys = T)
+C_alpha <- C_alpha$total[[1]]
+```
+
+
+## Extract SVDs
+
+```{r}
+set.seed(12345)
+folds <- sample(1:10, size = nrow(sparseM), replace = T)
+test <- folds == 1
+trait_array <- c("E_comp", "N_comp", "O_comp", "A_comp", "C_comp")
+predlassosvd_traits <- matrix(0, nrow(sparseM), length(trait_array)) #this is full matrix. Will need to subset out test. 
+colnames(predlassosvd_traits) <- trait_array
+
+
+#extract dimensions from training: 
+Msvd <- irlba(sparseM[!test,], nv = 1000)
+#rotate like SVD scores
+v_rot <- unclass(varimax(Msvd$v)$loadings)
+#rotate user SVD scores for the entire sample (i.e., not just training)
+u_rot <- as.data.frame(as.matrix(sparseM %*% v_rot))
+
+write.csv(u_rot, "svd1000.csv")
+u_rot <- read_csv("svd1000.csv")
+rownames(u_rot) <- u_rot$X1
+u_rot <- u_rot[,-1]
+```
+
+## Predict from LASSO
+
+```{r}
+library(doParallel)
+start_time <- Sys.time()
+#registerDoParallel(10)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(12345)
+#predict using lasso
+for (trait in trait_array) {
+  y <- pers_dat[!test, trait]
+  y <- as.vector(unlist(y))
+  #fit <- glm(y~., data = u_rot[!test,])
+  fit <- glmnet(as.matrix(u_rot[!test,]), y, alpha = 1)
+  mod.cv <- cv.glmnet(as.matrix(u_rot[!test,]), y,
+                      alpha = 1, nfold = 10, 
+                      lambda = seq(0,10,0.01),
+                      parallel = TRUE)
+  predlassosvd_traits[test, trait] <- predict(fit, s = mod.cv$lambda.min, newx = as.matrix(u_rot[test,]))  
+  #predlassosvd_traits[test, trait] <- predict(fit, u_rot[test,])  
+}
+stopCluster(cl)
+
+end_time <- Sys.time()
+end_time-start_time #6.848779 mins
+
+#need to remove the non-test set rows from the matrix now. 
+
+colnames(predlassosvd_traits) <- paste("pred", trait_array, sep = "") #do this after. Columns have to match for the loop
+rownames(predlassosvd_traits) <- rownames(sparseM)
+predlassosvd_traits <- predlassosvd_traits[test,]
+predlassosvd_traits <- as.data.frame(predlassosvd_traits)
+write.csv(predlassosvd_traits, "predlassosvd_traits.csv")
+
+predlassosvd_traits <- read_csv("predlassosvd_traits.csv")
+```
+
+
+Need to take only the test set observations
+```{r}
+cor(predlassosvd_traits)
+cor(pers_dat[test,]$E_comp, predlassosvd_traits$predE_comp)
+cor(pers_dat[test,]$N_comp, predlassosvd_traits$predN_comp)
+cor(pers_dat[test,]$O_comp, predlassosvd_traits$predO_comp)
+cor(pers_dat[test,]$A_comp, predlassosvd_traits$predA_comp)
+cor(pers_dat[test,]$C_comp, predlassosvd_traits$predC_comp)
+  
+```
+
+
+Now do same with questions
+
+```{r}
+q_array <- paste(rep("q", 100), seq(1,100), sep = "")
+predlassosvd_q <- matrix(0, nrow(sparseM), length(q_array))
+colnames(predlassosvd_q) <- paste(rep("q", 100), seq(1,100), sep = "")
+
+start_time <- Sys.time()
+#registerDoParallel(10)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(12345)
+#predict using lasso
+for (q in q_array) {
+  y <- pers_dat[!test, q]
+  y <- as.vector(unlist(y))
+  #fit <- glm(y~., data = u_rot[!test,])
+  fit <- glmnet(as.matrix(u_rot[!test,]), y, alpha = 1)
+  mod.cv <- cv.glmnet(as.matrix(u_rot[!test,]), y,
+                      alpha = 1, nfold = 10, 
+                      lambda = seq(0,10,0.01),
+                      parallel = TRUE)
+  predlassosvd_q[test, q] <- predict(fit, s = mod.cv$lambda.min, newx = as.matrix(u_rot[test,]))  
+  #predlassosvd_traits[test, trait] <- predict(fit, u_rot[test,])  
+}
+stopCluster(cl)
+
+colnames(predlassosvd_q) <- paste(rep("predq", 100), seq(1,100), sep = "")
+rownames(predlassosvd_q) <- rownames(sparseM)
+predlassosvd_q <- predlassosvd_q[test,]
+predlassosvd_q <- as.data.frame(predlassosvd_q)
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+time_taken #Time difference of 2.185039 hours
+```
+
+```{r}
+predlassosvd_q <- predlassosvd_q %>% 
+  mutate(
+    pred_E = (predq3 + predq10 +  (predq14) + (predq18) + predq23 + (predq29) + predq33 + (predq39) + predq43 + (predq49) + predq53 + (predq59) + predq63 + (predq69) + predq73 + (predq79) + predq83 + (predq89) + predq93 + (predq99))/20,
+    
+    pred_N = ((predq11) + predq12 + predq17 + (predq19) + (predq27) + predq30 + (predq37) + predq40 + (predq47) + predq50 +  (predq57) + predq60 +  (predq67) + predq70 + (predq77) + predq80 + (predq87) + predq90 + (predq97) + predq100)/20,
+    
+    pred_O = (predq1 + (predq4) + (predq7) + predq16 + predq21 + (predq24) + predq31 + (predq34) + predq41 + (predq44) + predq51 + (predq54) + predq61 + (predq64) + predq71 + (predq74) + predq81 + (predq84) + predq91 + (predq94))/20,
+    
+    pred_A = ((predq2) + predq6 + (predq9) +  predq13 + (predq22) + predq26 + (predq32) + predq36 + (predq42) + predq46 + (predq52) + predq56 + (predq62) + predq66 + (predq72) + predq76 + (predq82) + predq86 + (predq92) + predq96)/20,
+    
+    pred_C = (predq5 + (predq8) + predq15 + (predq20) + predq25 + (predq28) + predq35 + (predq38) + predq45 + (predq48) + predq55 + (predq58) + predq65 + (predq68) + predq75 + (predq78) + predq85 + (predq88) + predq95 + (predq98))/20
+  )
+
+write.csv(predlassosvd_q, "predlassosvd_q.csv")
+
+predlassosvd_q <- read_csv("predlassosvd_q.csv")
+```
+
+```{r}
+#item level
+cor.test(pers_dat[test,]$E_comp, predlassosvd_q$pred_E)$conf.int/sqrt(E_alpha) #divide bounds by sqrt(alpha) for all to get attenuated corr bounds
+cor.test(pers_dat[test,]$N_comp, predlassosvd_q$pred_N)$conf.int/sqrt(N_alpha)
+cor.test(pers_dat[test,]$O_comp, predlassosvd_q$pred_O)$conf.int/sqrt(O_alpha)
+cor.test(pers_dat[test,]$A_comp, predlassosvd_q$pred_A)$conf.int/sqrt(A_alpha)
+cor.test(pers_dat[test,]$C_comp, predlassosvd_q$pred_C)$conf.int/sqrt(C_alpha)
+
+#aggregate level
+cor.test(pers_dat[test,]$E_comp, predlassosvd_traits$predE_comp)$conf.int/sqrt(E_alpha)
+cor.test(pers_dat[test,]$N_comp, predlassosvd_traits$predN_comp)$conf.int/sqrt(N_alpha)
+cor.test(pers_dat[test,]$O_comp, predlassosvd_traits$predO_comp)$conf.int/sqrt(O_alpha)
+cor.test(pers_dat[test,]$A_comp, predlassosvd_traits$predA_comp)$conf.int/sqrt(A_alpha)
+cor.test(pers_dat[test,]$C_comp, predlassosvd_traits$predC_comp)$conf.int/sqrt(C_alpha)
+```
+
+
+```{r}
+lassosvd_cors <- matrix(c(
+cor(pers_dat[test,]$E_comp, predlassosvd_q$pred_E)/sqrt(E_alpha),
+cor(pers_dat[test,]$N_comp, predlassosvd_q$pred_N)/sqrt(N_alpha),
+cor(pers_dat[test,]$O_comp, predlassosvd_q$pred_O)/sqrt(O_alpha),
+cor(pers_dat[test,]$A_comp, predlassosvd_q$pred_A)/sqrt(A_alpha),
+cor(pers_dat[test,]$C_comp, predlassosvd_q$pred_C)/sqrt(C_alpha),
+#cor of component scores predicted outright with actual
+cor(pers_dat[test,]$E_comp, predlassosvd_traits$predE_comp)/sqrt(E_alpha),
+cor(pers_dat[test,]$N_comp, predlassosvd_traits$predN_comp)/sqrt(N_alpha),
+cor(pers_dat[test,]$O_comp, predlassosvd_traits$predO_comp)/sqrt(O_alpha),
+cor(pers_dat[test,]$A_comp, predlassosvd_traits$predA_comp)/sqrt(A_alpha),
+cor(pers_dat[test,]$C_comp, predlassosvd_traits$predC_comp)/sqrt(C_alpha),
+# prop better by items
+((cor(pers_dat[test,]$E_comp, predlassosvd_q$pred_E)/sqrt(E_alpha)) / (cor(pers_dat[test,]$E_comp, predlassosvd_traits$predE_comp)/sqrt(E_alpha)))-1,
+((cor(pers_dat[test,]$N_comp, predlassosvd_q$pred_N)/sqrt(N_alpha)) / (cor(pers_dat[test,]$N_comp, predlassosvd_traits$predN_comp)/sqrt(N_alpha)))-1,
+((cor(pers_dat[test,]$O_comp, predlassosvd_q$pred_O)/sqrt(O_alpha)) / (cor(pers_dat[test,]$O_comp, predlassosvd_traits$predO_comp)/sqrt(O_alpha)))-1,
+((cor(pers_dat[test,]$A_comp, predlassosvd_q$pred_A)/sqrt(A_alpha)) / (cor(pers_dat[test,]$A_comp, predlassosvd_traits$predA_comp)/sqrt(A_alpha)))-1,
+((cor(pers_dat[test,]$C_comp, predlassosvd_q$pred_C)/sqrt(C_alpha)) / (cor(pers_dat[test,]$C_comp, predlassosvd_traits$predC_comp)/sqrt(C_alpha))-1)), 
+nrow = 5, ncol = 3, byrow = F)
+
+rownames(lassosvd_cors) <- c("Extraversion", "Neuroticism", "Openness", "Agreeableness", "Conscientiousness")
+colnames(lassosvd_cors) <- c("Items Predicted", "Construct Predicted", "Items > Construct (Proportion)")
+lassosvd_cors %>% kable()
+```
+
+
+
+## Now use RF to predict from SVDs
+
+```{r}
+predRFsvd_traits <- matrix(0, nrow(sparseM), length(trait_array)) #this is full matrix. Will need to subset out test. 
+colnames(predRFsvd_traits) <- trait_array
+
+start_time <- Sys.time()
+#registerDoParallel(10)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(12345)
+#predict using RF
+for (trait in trait_array) {
+  y <- pers_dat[!test, trait]
+  y <- as.vector(unlist(y))
+  fit <- randomForest(y ~., data = u_rot[!test,])
+  predRFsvd_traits[test, trait] <- predict(fit, u_rot[test,])  
+}
+
+
+end_time <- Sys.time()
+end_time-start_time #14.53121 hours
+## When done: 
+stopCluster(cl)
+
+#need to remove the non-test set rows from the matrix now. 
+
+colnames(predRFsvd_traits) <- paste("pred", trait_array, sep = "") #do this after. Columns have to match for the loop
+rownames(predRFsvd_traits) <- rownames(sparseM)
+predRFsvd_traits <- as.data.frame(predRFsvd_traits)
+write.csv(predRFsvd_traits, "predRFsvd_traits.csv")
+```
+
+Try above in parallel
+
+```{r}
+predRFsvd_traits <- matrix(0, nrow(sparseM), length(trait_array)) #this is full matrix. Will need to subset out test. 
+colnames(predRFsvd_traits) <- trait_array
+
+library(doParallel)
+start_time <- Sys.time()
+#registerDoParallel(10)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+
+set.seed(12345)
+#predict using RF
+for (trait in trait_array) {
+  y <- pers_dat[!test, trait]
+  y <- as.vector(unlist(y))
+  fit <- foreach(ntree = rep(50,10), #50 trees each over ten cores
+                 .combine = combine, .multicombine = TRUE,
+                 .packages = "randomForest") %dopar% {
+                   randomForest(y~., data = u_rot[!test,], ntree = ntree)
+                 }
+  # randomForest(y ~., data = u_rot[!test,])
+  predRFsvd_traits[test, trait] <- predict(fit, u_rot[test,])  
+}
+
+end_time <- Sys.time()
+end_time-start_time # 1.580533 hours
+## When done: 
+stopCluster(cl)
+
+#need to remove the non-test set rows from the matrix now. 
+
+colnames(predRFsvd_traits) <- paste("pred", trait_array, sep = "") #do this after. Columns have to match for the loop
+rownames(predRFsvd_traits) <- rownames(sparseM)
+predRFsvd_traits <- as.data.frame(predRFsvd_traits)
+write.csv(predRFsvd_traits, "predRFsvd_traits.csv")
+
+predRFsvd_traits <- read_csv("predRFsvd_traits.csv")
+```
+
+
+
+
+```{r}
+predRFsvd_q <- matrix(0, nrow(sparseM), length(q_array)) #this is full matrix. Will need to subset out test. 
+colnames(predRFsvd_q) <- q_array
+
+
+library(doParallel)
+start_time <- Sys.time()
+#registerDoParallel(10)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+
+set.seed(12345)
+#predict using RF
+for (q in q_array) {
+  y <- pers_dat[!test, q]
+  y <- as.vector(unlist(y))
+  fit <- foreach(ntree = rep(50,10), #50 trees each over ten cores
+                 .combine = combine, .multicombine = TRUE,
+                 .packages = "randomForest") %dopar% {
+                   randomForest(y~., data = u_rot[!test,], ntree = ntree)
+                 }
+  # randomForest(y ~., data = u_rot[!test,])
+  predRFsvd_q[test, q] <- predict(fit, u_rot[test,])  
+}
+
+end_time <- Sys.time()
+end_time-start_time #
+## When done: 
+stopCluster(cl)
+
+#need to remove the non-test set rows from the matrix now. 
+
+colnames(predRFsvd_q) <- paste("pred", q_array, sep = "") #do this after. Columns have to match for the loop
+rownames(predRFsvd_q) <- rownames(sparseM)
+predRFsvd_q <- as.data.frame(predRFsvd_q)
+```
+
+
+```{r}
+predRFsvd_q <- predRFsvd_q %>% 
+  mutate(
+    pred_E = (predq3 + predq10 +  (predq14) + (predq18) + predq23 + (predq29) + predq33 + (predq39) + predq43 + (predq49) + predq53 + (predq59) + predq63 + (predq69) + predq73 + (predq79) + predq83 + (predq89) + predq93 + (predq99))/20,
+    
+    pred_N = ((predq11) + predq12 + predq17 + (predq19) + (predq27) + predq30 + (predq37) + predq40 + (predq47) + predq50 +  (predq57) + predq60 +  (predq67) + predq70 + (predq77) + predq80 + (predq87) + predq90 + (predq97) + predq100)/20,
+    
+    pred_O = (predq1 + (predq4) + (predq7) + predq16 + predq21 + (predq24) + predq31 + (predq34) + predq41 + (predq44) + predq51 + (predq54) + predq61 + (predq64) + predq71 + (predq74) + predq81 + (predq84) + predq91 + (predq94))/20,
+    
+    pred_A = ((predq2) + predq6 + (predq9) +  predq13 + (predq22) + predq26 + (predq32) + predq36 + (predq42) + predq46 + (predq52) + predq56 + (predq62) + predq66 + (predq72) + predq76 + (predq82) + predq86 + (predq92) + predq96)/20,
+    
+    pred_C = (predq5 + (predq8) + predq15 + (predq20) + predq25 + (predq28) + predq35 + (predq38) + predq45 + (predq48) + predq55 + (predq58) + predq65 + (predq68) + predq75 + (predq78) + predq85 + (predq88) + predq95 + (predq98))/20
+  )
+write.csv(predRFsvd_q, "predRFsvd_q.csv")
+
+predRFsvd_q <- read_csv("predRFsvd_q.csv")
+```
+
+```{r}
+#item level
+cor.test(pers_dat[test,]$E_comp, predRFsvd_q$pred_E)$conf.int/sqrt(E_alpha) #divide bounds by sqrt(alpha) for all to get attenuated corr bounds
+cor.test(pers_dat[test,]$N_comp, predRFsvd_q$pred_N)$conf.int/sqrt(N_alpha)
+cor.test(pers_dat[test,]$O_comp, predRFsvd_q$pred_O)$conf.int/sqrt(O_alpha)
+cor.test(pers_dat[test,]$A_comp, predRFsvd_q$pred_A)$conf.int/sqrt(A_alpha)
+cor.test(pers_dat[test,]$C_comp, predRFsvd_q$pred_C)$conf.int/sqrt(C_alpha)
+
+#aggregate level
+cor.test(pers_dat[test,]$E_comp, predRFsvd_traits$predE_comp)$conf.int/sqrt(E_alpha)
+cor.test(pers_dat[test,]$N_comp, predRFsvd_traits$predN_comp)$conf.int/sqrt(N_alpha)
+cor.test(pers_dat[test,]$O_comp, predRFsvd_traits$predO_comp)$conf.int/sqrt(O_alpha)
+cor.test(pers_dat[test,]$A_comp, predRFsvd_traits$predA_comp)$conf.int/sqrt(A_alpha)
+cor.test(pers_dat[test,]$C_comp, predRFsvd_traits$predC_comp)$conf.int/sqrt(C_alpha)
+```
+
+
+```{r}
+predRFsvd_q_cors <- matrix(c(
+cor(pers_dat[test,]$E_comp, predRFsvd_q$pred_E)/sqrt(E_alpha),
+cor(pers_dat[test,]$N_comp, predRFsvd_q$pred_N)/sqrt(N_alpha),
+cor(pers_dat[test,]$O_comp, predRFsvd_q$pred_O)/sqrt(O_alpha),
+cor(pers_dat[test,]$A_comp, predRFsvd_q$pred_A)/sqrt(A_alpha),
+cor(pers_dat[test,]$C_comp, predRFsvd_q$pred_C)/sqrt(C_alpha),
+#cor of component scores predicted outright with actual
+cor(pers_dat[test,]$E_comp, predRFsvd_traits$predE_comp)/sqrt(E_alpha),
+cor(pers_dat[test,]$N_comp, predRFsvd_traits$predN_comp)/sqrt(N_alpha),
+cor(pers_dat[test,]$O_comp, predRFsvd_traits$predO_comp)/sqrt(O_alpha),
+cor(pers_dat[test,]$A_comp, predRFsvd_traits$predA_comp)/sqrt(A_alpha),
+cor(pers_dat[test,]$C_comp, predRFsvd_traits$predC_comp)/sqrt(C_alpha),
+# prop better by items
+((cor(pers_dat[test,]$E_comp, predRFsvd_q$pred_E)/sqrt(E_alpha)) / (cor(pers_dat[test,]$E_comp, predRFsvd_traits$predE_comp)/sqrt(E_alpha)))-1,
+((cor(pers_dat[test,]$N_comp, predRFsvd_q$pred_N)/sqrt(N_alpha)) / (cor(pers_dat[test,]$N_comp, predRFsvd_traits$predN_comp)/sqrt(N_alpha)))-1,
+((cor(pers_dat[test,]$O_comp, predRFsvd_q$pred_O)/sqrt(O_alpha)) / (cor(pers_dat[test,]$O_comp, predRFsvd_traits$predO_comp)/sqrt(O_alpha)))-1,
+((cor(pers_dat[test,]$A_comp, predRFsvd_q$pred_A)/sqrt(A_alpha)) / (cor(pers_dat[test,]$A_comp, predRFsvd_traits$predA_comp)/sqrt(A_alpha)))-1,
+((cor(pers_dat[test,]$C_comp, predRFsvd_q$pred_C)/sqrt(C_alpha)) / (cor(pers_dat[test,]$C_comp, predRFsvd_traits$predC_comp)/sqrt(C_alpha))-1)), 
+nrow = 5, ncol = 3, byrow = F)
+
+rownames(predRFsvd_q_cors) <- c("Extraversion", "Neuroticism", "Openness", "Agreeableness", "Conscientiousness")
+colnames(predRFsvd_q_cors) <- c("Items Predicted", "Construct Predicted", "Items > Construct (Proportion)")
+predRFsvd_q_cors %>% kable()
+```
+
+
+Save personality test data for ggplot comparisons: 
+```{r}
+write.csv(pers_dat[test,], "pers_dat_test")
+```

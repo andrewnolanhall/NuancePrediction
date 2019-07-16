@@ -1,0 +1,411 @@
+---
+title: "Predicting Nuances -- Data Vis"
+author: "Andrew N Hall, Sandra Matz"
+date: "7/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load data through Data prep source
+
+```{r message = F, warning= F}
+source("DataPrep_visualizations.R")
+```
+
+## Plotting differences in correlations
+
+### LASSO plot
+
+```{r}
+lassosvd_cors$Trait <- factor(lassosvd_cors$Trait, levels = lassosvd_cors$Trait[order(lassosvd_cors$ConstructPredicted)])
+lassosvd_cors_long <- lassosvd_cors %>% 
+  gather(key = Model, value = Corr, -c(Trait, ItemsOverConstruct_Proportion)) %>% 
+  mutate(Model = if_else(Model == "ItemsPredicted", "Nuance", "Trait"))
+
+lasso_cors_comparison <- lassosvd_cors_long %>% ggplot() +
+  geom_segment(data = lassosvd_cors, aes(x = Trait, xend = Trait, 
+                                         y = ItemsPredicted, yend = ConstructPredicted),
+               color = "grey") +
+  geom_point(aes(x = Trait, y = Corr, color = Model), size = 3) +
+  scale_y_continuous(limits = c(.2, .45)) +
+  scale_color_manual("Source of Prediction",
+                      values = c(rgb(0.2,0.7,0.1,0.6), 
+                                 rgb(0.7,0.2,0.1,0.6)),
+                     labels = c("Item-Level", "Aggregate-Level")) +
+  coord_flip() +
+  theme_light() +
+  theme(legend.position = c(.75,.25),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(color = "black"),
+        legend.text = element_text(size = 10),
+        axis.text.y = element_text(color = "black")) +
+  xlab("") +
+  ylab("Correlation with Self-Report") +
+  ggtitle("Correlations of Predicted Personality Traits\nwith Self-Report (LASSO)")
+lasso_cors_comparison
+```
+
+
+### RF plot
+
+```{r}
+rfsvd_cors$Trait <- factor(rfsvd_cors$Trait, levels = rfsvd_cors$Trait[order(lassosvd_cors$ConstructPredicted)]) #order based on lasso
+rfsvd_cors_long <- rfsvd_cors %>% 
+  gather(key = Model, value = Corr, -c(Trait, ItemsOverConstruct_Proportion)) %>% 
+  mutate(Model = if_else(Model == "ItemsPredicted", "Nuance", "Trait"))
+
+rf_cors_comparison <- rfsvd_cors_long %>% ggplot() +
+  geom_segment(data = rfsvd_cors, aes(x = Trait, xend = Trait, 
+                                         y = ItemsPredicted, yend = ConstructPredicted),
+               color = "grey") +
+  geom_point(aes(x = Trait, y = Corr, color = Model), size = 3) +
+  scale_y_continuous(limits = c(.2, .45)) +
+  scale_color_manual("Source of Prediction",
+                     values = c(rgb(0.2,0.7,0.1,0.6), 
+                                rgb(0.7,0.2,0.1,0.6)),
+                     labels = c("Item-Level", "Aggregate-Level")) +
+  coord_flip() +
+  theme_light() +
+  theme(legend.position = c(.75,.25),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(color = "black"),
+        legend.text = element_text(size = 10),
+        axis.text.y = element_text(color = "black")) +
+  xlab("") +
+  ylab("Correlation with Self-Report") +
+  ggtitle("Correlations of Predicted Personality Traits\nwith Self-Report (Random Forest)")
+
+rf_cors_comparison
+```
+
+### Above plots together
+```{r, fig.width= 8, fig.height=10}
+combined_comparison <- cowplot::plot_grid(lasso_cors_comparison, rf_cors_comparison, 
+                   nrow = 2)
+
+ggsave("Combined_Cor_Comparson.jpeg")
+
+```
+
+## Plotting Trait and Nuance Predictions vs Actual
+
+```{r fig.width = 10, fig.height = 12}
+combined_lasso_long <- combined_lasso %>% 
+  gather(key = variable, value = value, -c(userid:C_comp, predq1:predq100)) %>% 
+  separate(variable, c("Model", "Pred", "Trait")) %>% 
+  select(-Pred) %>%
+  mutate(Model= if_else(Model == "lassotrait", "Trait", "Nuance")) %>%
+  spread(Trait, value)
+
+combined_lasso_long_temp <- combined_lasso_long %>% select(-Model) #has all same values except for the model variable so will remain gray for background values
+
+
+E <- ggplot(combined_lasso_long, aes(y = E, x = E_comp)) +
+  geom_point(data = combined_lasso_long_temp, color = "grey", alpha = .6) +
+  geom_point(aes(fill = Model),
+             color = "white", pch = 21, 
+             alpha = 0.6,
+             size = 2) +
+  scale_fill_manual("Prediction Source", 
+                    values = c("#D55E0040", "#0072B240")) +
+  stat_smooth(method = "lm", color = "#0072B240", ) +
+  facet_grid(~Model) +
+  labs(x = "Self-Reported Extraversion",
+       y = "Predicted Extraversion",
+       title = "Extraversion") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+N <- ggplot(combined_lasso_long, aes(y = N, x = N_comp)) +
+  geom_point(data = combined_lasso_long_temp, color = "grey", alpha = .6) +
+  geom_point(aes(fill = Model),
+             color = "white", pch = 21, 
+             alpha = 0.6,
+             size = 2) +
+  scale_fill_manual("Prediction Source", 
+                    values = c("#D55E0040", "#0072B240")) +
+  stat_smooth(method = "lm", color = "#0072B240", ) +
+  facet_grid(~Model) +
+  labs(x = "Self-Reported Neuroticism",
+       y = "Predicted Neuroticism",
+       title = "Neuroticism") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+O <- ggplot(combined_lasso_long, aes(y = O, x = O_comp)) +
+  geom_point(data = combined_lasso_long_temp, color = "grey", alpha = .6) +
+  geom_point(aes(fill = Model),
+             color = "white", pch = 21, 
+             alpha = 0.6,
+             size = 2) +
+  scale_fill_manual("Prediction Source", 
+                    values = c("#D55E0040", "#0072B240")) +
+  stat_smooth(method = "lm", color = "#0072B240", ) +
+  facet_grid(~Model) +
+  labs(x = "Self-Reported Openness",
+       y = "Predicted Openness",
+       title = "Openness") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+A <- ggplot(combined_lasso_long, aes(y = A, x = A_comp)) +
+  geom_point(data = combined_lasso_long_temp, color = "grey", alpha = .6) +
+  geom_point(aes(fill = Model),
+             color = "white", pch = 21, 
+             alpha = 0.6,
+             size = 2) +
+  scale_fill_manual("Prediction Source", 
+                    values = c("#D55E0040", "#0072B240")) +
+  stat_smooth(method = "lm", color = "#0072B240", ) +
+  facet_grid(~Model) +
+  labs(x = "Self-Reported Agreeableness",
+       y = "Predicted Agreeableness",
+       title = "Agreeableness") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+C <- ggplot(combined_lasso_long, aes(y = C, x = C_comp)) +
+  geom_point(data = combined_lasso_long_temp, color = "grey", alpha = .6) +
+  geom_point(aes(fill = Model),
+             color = "white", pch = 21, 
+             alpha = 0.6,
+             size = 2) +
+  scale_fill_manual("Prediction Source", 
+                    values = c("#D55E0040", "#0072B240")) +
+  stat_smooth(method = "lm", color = "#0072B240", ) +
+  facet_grid(~Model) +
+  labs(x = "Self-Reported Conscientiousness",
+       y = "Predicted Conscientiousness",
+       title = "Conscientiousness") +
+  theme_minimal() +
+  theme(legend.position = "none")
+cowplot::plot_grid(E, N, O, A, C, nrow = 3)
+```
+
+### Predicting Outcomes for Each Trait
+
+```{r fig.height= 10, fig.width=8}
+# Extraversion
+e_cors_diff <- e_cors %>% rownames_to_column() %>% 
+  mutate(Trait = abs(Trait),
+         Nuance = abs(Nuance),
+         Diff = Nuance - Trait,
+         NuanceMore = if_else(Diff >= 0, 
+                              "Nuance Predicts Better", 
+                              "Trait Predicts Better")) %>% 
+  ggplot(aes(x = reorder(rowname, Diff),
+             y = Diff, 
+             fill = NuanceMore)) +
+  scale_fill_brewer("Item-Level or Aggregate-Level\nPredicts Better", 
+                    palette = "Set1",
+                    direction = -1) +
+  scale_y_continuous(limits = c(-0.02, 0.05)) +
+  ylab("Difference in Raw Correlation (Abs Value)") +
+  ggtitle("Extraversion") +
+  xlab(NULL) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 300, 
+                                   hjust = 0.15,
+                                   vjust = 0,
+                                   size = 4),
+        axis.title.y = element_text(size = 6),
+        legend.position = "none")
+
+# Neuroticism
+n_cors_diff <- n_cors %>% rownames_to_column() %>% 
+  mutate(Trait = abs(Trait),
+         Nuance = abs(Nuance),
+         Diff = Nuance - Trait,
+         NuanceMore = if_else(Diff >= 0, 
+                              "Nuance Predicts Better", 
+                              "Trait Predicts Better")) %>% 
+  ggplot(aes(x = reorder(rowname, Diff),
+             y = Diff, 
+             fill = NuanceMore)) +
+  scale_fill_brewer("Item-Level or Aggregate-Level\nPredicts Better", 
+                    palette = "Set1",
+                    direction = -1) +
+  scale_y_continuous(limits = c(-0.02, 0.05)) +
+  ylab("Difference in Raw Correlation (Abs Value)") +
+  ggtitle("Neuroticism") +
+  xlab(NULL) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 300, 
+                                   hjust = 0.15,
+                                   vjust = 0,
+                                   size = 4),
+        axis.title.y = element_text(size = 6),
+        legend.position = "none")
+
+# Openness
+o_cors_diff <- o_cors %>% rownames_to_column() %>% 
+  mutate(Trait = abs(Trait),
+         Nuance = abs(Nuance),
+         Diff = Nuance - Trait,
+         NuanceMore = if_else(Diff >= 0, 
+                              "Nuance Predicts Better", 
+                              "Trait Predicts Better")) %>% 
+  ggplot(aes(x = reorder(rowname, Diff),
+             y = Diff, 
+             fill = NuanceMore)) +
+  scale_fill_brewer("Item-Level or Aggregate-Level\nPredicts Better", 
+                    palette = "Set1",
+                    direction = -1) +
+  scale_y_continuous(limits = c(-0.02, 0.05)) +
+  ylab("Difference in Raw Correlation (Abs Value)") +
+  ggtitle("Openness") +
+  xlab(NULL) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 300, 
+                                   hjust = 0.15,
+                                   vjust = 0,
+                                   size = 4),
+        axis.title.y = element_text(size = 6),
+        legend.position = "none")
+
+# Agreeableness
+a_cors_diff <- a_cors %>% rownames_to_column() %>% 
+  mutate(Trait = abs(Trait),
+         Nuance = abs(Nuance),
+         Diff = Nuance - Trait,
+         NuanceMore = if_else(Diff >= 0, 
+                              "Nuance Predicts Better", 
+                              "Trait Predicts Better")) %>% 
+  ggplot(aes(x = reorder(rowname, Diff),
+             y = Diff, 
+             fill = NuanceMore)) +
+  scale_fill_brewer("Item-Level or Aggregate-Level\nPredicts Better", 
+                    palette = "Set1",
+                    direction = -1) +
+  scale_y_continuous(limits = c(-0.02, 0.05)) +
+  ylab("Difference in Raw Correlation (Abs Value)") +
+  ggtitle("Agreeableness") +
+  xlab(NULL) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 300, 
+                                   hjust = 0.15,
+                                   vjust = 0,
+                                   size = 4),
+        axis.title.y = element_text(size = 6),
+        legend.position = "none")
+
+#Conscientiousness
+c_cors_diff <- c_cors %>% rownames_to_column() %>% 
+  mutate(Trait = abs(Trait),
+         Nuance = abs(Nuance),
+         Diff = Nuance - Trait,
+         NuanceMore = if_else(Diff >= 0, 
+                              "Nuance Predicts Better", 
+                              "Trait Predicts Better")) %>% 
+  ggplot(aes(x = reorder(rowname, Diff),
+             y = Diff, 
+             fill = NuanceMore)) +
+  scale_fill_brewer("Item-Level or Aggregate-Level\nPredicts Better", 
+                    palette = "Set1",
+                    direction = -1) +
+  scale_y_continuous(limits = c(-0.02, 0.05)) +
+  ylab("Difference in Raw Correlation (Abs Value)") +
+  ggtitle("Conscientiousness") +
+  xlab(NULL) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 300, 
+                                   hjust = 0.15,
+                                   vjust = 0,
+                                   size = 4),
+        axis.title.y = element_text(size = 6),
+        legend.position = "none")
+
+cors_diff_legend <- c_cors %>% rownames_to_column() %>% 
+  mutate(Trait = abs(Trait),
+         Nuance = abs(Nuance),
+         Diff = Nuance - Trait,
+         NuanceMore = if_else(Diff >= 0, 
+                              "Item-Level Predicts Better", 
+                              "Aggregate-Level Predicts Better")) %>% 
+  ggplot(aes(x = reorder(rowname, Diff),
+             y = Diff, 
+             fill = NuanceMore)) +
+  scale_fill_brewer("Item-Level or Aggregate-Level\nPredicts Better", 
+                    palette = "Set1",
+                    direction = 1) +
+  geom_bar(stat = "identity") +
+  theme(legend.position = c(0.5,0.5),
+        panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        axis.text = element_blank(),
+        legend.box.background = element_rect(color = "black")) +
+  guides(fill = guide_legend(reverse = T)) + 
+  geom_bar(stat = "identity", fill = "white", color = "white")
+
+# Plot together: 
+cowplot::plot_grid(e_cors_diff, n_cors_diff, o_cors_diff, a_cors_diff, c_cors_diff, cors_diff_legend, nrow = 3)
+ggsave("OutcomeCorComparison.jpeg")
+```
+
+
+
+
+### Predicting Outcomes from All Five Traits
+
+```{r fig.width= 8, fig.height= 8}
+pred_cors %>% ggplot(aes(x = Trait, y = Nuance)) +
+  geom_point(aes(color = NuanceMore),
+             size = 3) +
+  scale_color_brewer("Item-Level or Aggregate-Level\nTraits Predict Better?",
+                     palette = "Set1",
+                     direction = 1) +
+  xlim(c(0,.4)) + #What are the average correlations across traits? Would they be significantly different from another
+  ylim(c(0,.4)) +
+  geom_abline() +
+  geom_text_repel(aes(label = rowname),
+                  seed = 12345,
+                  color = "black",
+                  box.padding = 0.3) +
+  ggtitle("Correlations of Item-Level Predictions and Aggregate-Level Predictions\nwith Self-Report Predictions") +
+  xlab("Correlation of Aggregate-Level Model and Self-Report Predictions") +
+  ylab("Correlation of Item-Level Model and Self-Report Predictions") +
+  theme_minimal() +
+  theme(legend.position = c(0.8, 0.2),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(color = "black"),
+        legend.text = element_text(size = 10)) +
+  guides(color = guide_legend(reverse = T))
+
+ggsave("OutcomePredictions.jpeg")
+```
+
+```{r}
+pred_cors_nuance %>% ggplot(aes(x = Trait, y = Nuance)) +
+  geom_point(aes(color = NuanceMore),
+             size = 3) +
+  scale_color_brewer("Nuance or Trait Predicts Better",
+                     palette = "Set1",
+                     direction = -1) +
+  xlim(c(0,.4)) + #What are the average correlations across traits? Would they be significantly different from another
+  ylim(c(0,.4)) +
+  geom_abline() +
+  geom_text_repel(aes(label = rowname),
+                  seed = 12345,
+                  color = "black",
+                  box.padding = 0.3) +
+  ggtitle("Correlations of Nuance Predictions and Trait Predictions\nwith Self-Report Predictions") +
+  xlab("Correlation of Trait Model and Self-Report Predictions") +
+  ylab("Correlation of Nuance Model and Self-Report Predictions") +
+  theme_minimal() +
+  theme(legend.position = c(0.8, 0.2),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(color = "black"),
+        legend.text = element_text(size = 10))
+ggsave("OutcomePredictionsVersion2.jpeg")
+```
+
